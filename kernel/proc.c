@@ -127,6 +127,12 @@ found:
     return 0;
   }
 
+  if ((p->usyscall = (struct usyscall *)kalloc()) == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -135,11 +141,31 @@ found:
     return 0;
   }
 
+  // Allocate the per-process kernel page table
+  // 为这个进程分配并初始化一个新的专属内核页
+  p->kpagetable = ukvminit();
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // remap the kernel stack page per process
+  // physical address is already allocated in procinit()
+  // 每个kernel stack的虚拟地址va是已经提前决定好的 直接算出它对应的pa
+  // 然后把这个映射加入到新的专属内核页里
+  uint64 va = KSTACK((int)(p - proc));
+  pte_t pa = kvmpa(va);
+  memset((void*)pa, 0, PGSIZE); // 刷新清空kernel stack
+  kvmmap(p->kpagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+  p->usyscall->pid = p->pid;
 
   return p;
 }
@@ -153,6 +179,9 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if(p->usyscall)
+    kfree((void*)p->usyscall);
+  p->usyscall = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -164,6 +193,13 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  if (p->kpagetable) {
+    freeprockvm(p);
+    p->kpagetable = 0;
+  }
+  if (p->kstack) {
+    p->kstack = 0;
+  }
 }
 
 // Create a user page table for a given process,
@@ -196,6 +232,14 @@ proc_pagetable(struct proc *p)
     return 0;
   }
 
+  if(mappages(pagetable, USYSCALL, PGSIZE,
+              (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    uvmfree(pagetable, 0);
+    return 0;
+  }
+
   return pagetable;
 }
 
@@ -206,6 +250,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmunmap(pagetable, USYSCALL, 1, 0);
   uvmfree(pagetable, sz);
 }
 
@@ -235,6 +280,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  pagecopy(p->pagetable, p->kpagetable, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -257,12 +304,20 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    if (sz + n > PLIC || (sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+      return -1;
+    }
+
+    if (pagecopy(p->pagetable, p->kpagetable, p->sz, sz) != 0) {
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    if (sz != p->sz) {
+      uvmunmap(p->kpagetable, PGROUNDUP(sz), (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
+    }
   }
+  ukvminithard(p->kpagetable);
   p->sz = sz;
   return 0;
 }
@@ -288,6 +343,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  if (pagecopy(np->pagetable, np->kpagetable, 0, np->sz) != 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -453,7 +514,15 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        _satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
+
+        // Process is done running for now.
+        // It should have changed its p->state before coming back.
+        // 切换回全局内核页表
+        kvminithart();
+        c->proc = 0;
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

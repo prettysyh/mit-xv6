@@ -5,6 +5,7 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -128,6 +129,167 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 {
   if(mappages(kpgtbl, va, sz, pa, perm) != 0)
     panic("kvmmap");
+}
+
+
+void
+ukvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if (mappages(kpgtbl, va, sz, pa, perm) != 0)
+    panic("ukvmmap");
+}
+
+void
+ukvminit()
+{
+  pagetable_t kpgtbl;
+
+  kpgtbl = (pagetable_t) kalloc();
+  if (kpgtbl == 0) 
+    return kpgtbl;
+  
+  memset(kpgtbl, 0, PGSIZE);
+
+  // uart registers
+  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // CLINT
+  ukvmmap(kpgtbl, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+ 
+  // PLIC
+  kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return kpgtbl;
+}
+
+void
+ukvmunmap(pagetable_t pagetable, uint64 va, uint64 npages)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("uvmunmap: not aligned");
+
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
+      goto clean;
+    if((*pte & PTE_V) == 0)
+      goto clean;
+    if(PTE_FLAGS(*pte) == PTE_V)
+      panic("uvmunmap: not a leaf");
+    
+    clean:
+      *pte = 0;
+  }
+}
+
+// Recursively free page-table pages similar to freewalk
+// not need to already free leaf node
+// 和freewalk一模一样, 除了不再出panic错当一个page的leaf还没被清除掉
+// 因为当我们free pagetable和kpagetable的时候
+// 只有1份物理地址, 且原本free pagetable的函数会负责清空它们
+// 所以这个函数只需要把在kpagetable里所有间接mapping清除即可
+void
+freewalk(pagetable_t pagetable)
+{
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      ufreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+    pagetable[i] = 0;
+  }
+  kfree((void*)pagetable);
+}
+
+// helper function to first free all leaf mapping
+// of a per-process kernel table but do not free the physical address
+// and then remove all 3-levels indirection and the physical address
+// for this kernel page itself
+void
+freeprockvm(struct proc* p)
+{
+  pagetable_t kpagetable = p->kpagetable;
+  // 按分配顺序的逆序来销毁映射, 但不回收物理地址
+  ukvmunmap(kpagetable, p->kstack, PGSIZE/PGSIZE);
+  ukvmunmap(kpagetable, TRAMPOLINE, PGSIZE/PGSIZE);
+  ukvmunmap(kpagetable, (uint64)etext, (PHYSTOP-(uint64)etext)/PGSIZE);
+  ukvmunmap(kpagetable, KERNBASE, ((uint64)etext-KERNBASE)/PGSIZE);
+  ukvmunmap(kpagetable, PLIC, 0x400000/PGSIZE);
+  ukvmunmap(kpagetable, CLINT, 0x10000/PGSIZE);
+  ukvmunmap(kpagetable, VIRTIO0, PGSIZE/PGSIZE);
+  ukvmunmap(kpagetable, UART0, PGSIZE/PGSIZE);
+  ufreewalk(kpagetable);
+}
+
+// Same as mappages without panic on remapping
+// 和mappages一模一样, 只不过不再panic remapping, 直接强制复写
+int
+umappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  uint64 a, last;
+  pte_t *pte;
+
+  a = PGROUNDDOWN(va);
+  last = PGROUNDDOWN(va + size - 1);
+  for(;;) {
+    if((pte = walk(pagetable, a, 1)) == 0)
+      return -1;
+    *pte = PA2PTE(pa) | perm | PTE_V;
+    if(a == last)
+      break;
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return 0;
+}
+
+// copying from old page to new page from
+// begin in old page to new in old page
+// and mask off PTE_U bit
+// 将从begin到end的虚拟地址的映射, 从oldpage复制到newpage
+int
+pagecopy(pagetable_t oldpage, pagetable_t newpage, uint64 begin, uint64 end) {
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  begin = PGROUNDUP(begin);
+
+  for (i = begin; i < end; i += PGSIZE) {
+    if ((pte = walk(oldpage, i, 0)) == 0)
+      panic("pagecopy walk oldpage nullptr");
+    if ((*pte & PTE_V) == 0)
+      panic("pagecopy oldpage pte not valid");
+
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte) & (~PTE_U);
+
+    if (umappages(newpage, i, PGSIZE, pa, flags) != 0) {
+      goto err;
+    }
+  }
+  return 0;
+
+  err:
+    uvmunmap(newpage, 0, i / PGSIZE, 1);
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -431,4 +593,26 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// lab3 pgtbl : print vm
+static void vmprint_helper(pagetable_t pagetable,int level){
+    if(level > 3)
+        return;
+    for(int i = 0; i < 512; i++){
+        pte_t pte = pagetable[i];
+        if(pte & PTE_V){
+            uint64 child = PTE2PA(pte);
+            for(int j = 0; j < level; j++)
+                printf(" ..");
+            printf("%d: pte %p pa %p\n",i,pte,child);
+            vmprint_helper((pagetable_t)child,level+1);
+        }
+    }
+}
+
+void vmprint(pagetable_t pagetable){
+    printf("page table %p\n",pagetable);
+    vmprint_helper(pagetable,1);
+    return;
 }
