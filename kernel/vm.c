@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -110,10 +112,23 @@ walkaddr(pagetable_t pagetable, uint64 va)
     return 0;
 
   pte = walk(pagetable, va, 0);
-  if(pte == 0)
-    return 0;
-  if((*pte & PTE_V) == 0)
-    return 0;
+  // if(pte == 0)
+  //   return 0;
+  // if((*pte & PTE_V) == 0)
+  //   return 0;
+
+  if (pte == 0 || (*pte & PTE_V) == 0) {
+    struct proc *p = myproc();
+    if (va >= p->sz || va < PGROUNDUP(p->trapframe->sp))  return 0;
+    pa = (uint64)kalloc();
+    if (pa == 0)  return 0;
+    if (mappages(p->pagetable, va, PGSIZE, pa, PTE_R | PTE_W | PTE_U | PTE_X) != 0) {
+      kfree((void*)pa);
+      return 0;
+    } 
+    return pa;
+  }
+
   if((*pte & PTE_U) == 0)
     return 0;
   pa = PTE2PA(*pte);
@@ -175,7 +190,8 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      // panic("uvmunmap: not mapped");
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -303,7 +319,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -311,14 +327,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    *pte = (*pte & ~PTE_W) | PTE_C;
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+
+    add_rc(pa);
   }
   return 0;
 
@@ -346,11 +364,30 @@ uvmclear(pagetable_t pagetable, uint64 va)
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
-  uint64 n, va0, pa0;
+  uint64 n, va0, pa0, flag;
+  pte_t* pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddr(pagetable, va0);
+    if (va0 >= MAXVA)
+      return -1;    
+
+    pte = walk(pagetable, va0, 0);
+    if (pte == 0)
+      return -1;
+    pa0 = PTE2PA(*pte);
+    flag = PTE_FLAGS(*pte);
+
+    if (flag & PTE_C) {
+      uint64 mem = (uint64)kalloc();
+      if (mem == 0)
+        return -1;
+      memmove((void*)mem, (void*)pa0, PGSIZE);
+      kfree((void*)pa0);
+      *pte = PA2PTE(mem) | (flag & ~PTE_C) | PTE_W;
+      pa0 = mem;
+    }
+
     if(pa0 == 0)
       return -1;
     n = PGSIZE - (dstva - va0);
@@ -372,12 +409,24 @@ int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
-
+  struct proc* p = myproc();
+  
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
+    if(pa0 == 0) {
+      // return -1;
+      if (p->sz <= va0)
+        return -1;
+      pa0 = (uint64)kalloc();
+      if (pa0 == 0) 
+        return -1;
+      memset((void*)pa0, 0, PGSIZE);
+      if (mappages(pagetable, va0, PGSIZE, pa0, PTE_U | PTE_R | PTE_X | PTE_W) != 0) {
+        kfree((void*)pa0);
+        return -1;
+      }
+    } 
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
