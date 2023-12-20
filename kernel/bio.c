@@ -23,15 +23,50 @@
 #include "fs.h"
 #include "buf.h"
 
+#define HASHSIZE 17
+
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
 
+  struct spinlock hashlock[HASHSIZE];
+  struct buf buckets[HASHSIZE];
   // Linked list of all buffers, through prev/next.
   // Sorted by how recently the buffer was used.
   // head.next is most recent, head.prev is least.
-  struct buf head;
 } bcache;
+
+static int hash(uint dev, uint blockno) {
+  return (dev + blockno) % HASHSIZE;
+}
+
+static void insert(struct buf *buf) {
+  uint dev = buf->dev, blockno = buf->blockno;
+  int idx = hash(dev, blockno);
+  buf->next = bcache.buckets[idx].next;
+  bcache.buckets[idx].next = buf;
+}
+
+static struct buf* find(uint dev, uint blockno) {
+  struct buf* b;
+  int idx = hash(dev, blockno);
+  for (b = bcache.buckets[idx].next; b != 0; b = b->next) {
+    if (b->dev == dev && b->blockno == blockno)
+      return b;
+  }
+  return 0;
+}
+
+static void erase(uint dev,uint blockno) {
+  struct buf* b;
+  int idx = hash(dev, blockno);
+  for (b = &bcache.buckets[idx]; b->next != 0; b = b->next) {
+    if (b->next->dev == dev && b->next->blockno == blockno) {
+      b->next = b->next->next;
+      return;
+    }
+  }
+}
 
 void
 binit(void)
@@ -41,15 +76,11 @@ binit(void)
   initlock(&bcache.lock, "bcache");
 
   // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
     initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
   }
+  for (int i = 0; i < HASHSIZE; i ++ )
+    initlock(bcache.hashlock, "bcache_hash");
 }
 
 // Look through buffer cache for block on device dev.
@@ -60,29 +91,41 @@ bget(uint dev, uint blockno)
 {
   struct buf *b;
 
-  acquire(&bcache.lock);
+  int idx = hash(dev, blockno);
 
   // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      b->refcnt++;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
+  acquire(&bcache.hashlock[idx]);
+  if ((b = find(dev, blockno)) != 0) {
+    b->refcnt ++ ;
+    release(&bcache.hashlock[idx]);
+    acquiresleep(&b->lock);
+    return b;
   }
 
   // Not cached.
   // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
+  for (int i = 0; i < NBUF; i ++ ) {
+    b = &bcache.buf[i];
+    int bucket = hash(b->dev, b->blockno);
+    if (bucket != idx) {
+      acquire(&bcache.hashlock[bucket]);
+    }
+    if (b->refcnt == 0) {
+      erase(b->dev, b->blockno);
       b->dev = dev;
       b->blockno = blockno;
       b->valid = 0;
       b->refcnt = 1;
-      release(&bcache.lock);
+      insert(b);
+
+      if (bucket != idx)
+        release(&bcache.hashlock[bucket]);
+      release(&bcache.hashlock[idx]);
       acquiresleep(&b->lock);
       return b;
+    }
+    if (bucket != idx) {
+      release(&bcache.hashlock[bucket]);
     }
   }
   panic("bget: no buffers");
@@ -120,34 +163,26 @@ brelse(struct buf *b)
     panic("brelse");
 
   releasesleep(&b->lock);
-
-  acquire(&bcache.lock);
+  int idx = hash(b->dev, b->blockno);
+  acquire(&bcache.hashlock[idx]);
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
+  release(&bcache.hashlock[idx]);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int idx = hash(b->dev, b->blockno);
+  acquire(&bcache.hashlock[idx]);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bcache.hashlock[idx]);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int idx = hash(b->dev, b->blockno);
+  acquire(&bcache.hashlock[idx]);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bcache.hashlock[idx]);
 }
 
 
